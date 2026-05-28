@@ -1,0 +1,20 @@
+# Large model files
+TinyLlama-1.1B/
+TinyLlama-1.1B-Chat-v1.0/
+
+# Data files
+dataset/
+information/
+reviews_Books_5.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Training outputs
+train_loss.txt
+test_metrics.txt
+checkpoints/
+
+# IDE
+.vscode/

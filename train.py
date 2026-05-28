@@ -1,0 +1,75 @@
+import torch
+import numpy as np
+from model import HLLM
+def metric(HLLM, test_loader, all_item_ids, all_item_cu_lens, all_item_position_ids, list_k=[10, 20, 50, 100]):
+    """评估HLLM的召回率和NDCG
+    Args:
+        HLLM (_type_): 模型
+        test_loader (_type_): 测试数据加载器
+        all_item_ids: 所有物品的ID token列表
+        all_item_cu_lens: 所有物品ID token列表的累积长度列表
+        all_item_position_ids: 所有物品ID token列表对应的位置ID列表
+        list_k (_type_): Top-k 列表
+    Returns:
+        recall_dict: 召回率字典，key为k，value为对应的平均召回率
+        ndcg_dict: NDCG字典，key为k，value为对应的平均NDCG值
+    """
+    HLLM.eval()
+    recall_dict = {k: [] for k in list_k}
+    ndcg_dict = {k: [] for k in list_k}
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            seq = batch["history"].to(HLLM.device)  # [N, S] 用户历史序列
+            pos_id = batch["pos_id"].to(HLLM.device)  # [N] 正样本物品ID
+            mask = batch["mask"].to(HLLM.device)  # [N, S] 序列掩码
+            score = HLLM._predict(seq, mask, all_item_ids, all_item_cu_lens, all_item_position_ids) #[N, len(all_item_ids)]
+            for k in list_k:
+                top_k_indices = torch.topk(score, k=k, dim=1).indices  # [N, k]
+                top_k_item_ids = top_k_indices.cpu().numpy()  # [N, k] 转为 numpy 数组
+                pos_id_expanded = (pos_id.unsqueeze(1)).cpu().numpy()  # [N, 1]
+                hits = (top_k_item_ids == pos_id_expanded).float()  # [N, k] 是否命中正样本
+                recall = hits.sum(dim=1) # [N] 召回率（正样本是否在Top-k中）
+                ndcg = hits / np.log2(np.arange(2, k + 2).float())  # [N, k] NDCG增益
+                ndcg = ndcg.sum(dim=1)  # [N] NDCG值
+                recall_dict[k].extend(recall.cpu().numpy())
+                ndcg_dict[k].extend(ndcg.cpu().numpy())
+    for k in list_k:
+        recall_dict[k] = np.mean(recall_dict[k])
+        ndcg_dict[k] = np.mean(ndcg_dict[k])
+    return recall_dict, ndcg_dict
+
+
+def train(HLLM, train_loader, test_loader, all_item_ids, all_item_cu_lens, all_item_position_ids, optimizer, scheduler, epoch):
+    """
+    训练
+    Args:
+        HLLM (_type_): HLLM 模型实例
+        train_loader (_type_): 训练数据加载器
+        test_loader (_type_): 测试数据加载器
+        all_item_ids: 所有物品的ID token列表
+        all_item_cu_lens: 所有物品ID token列表的累积长度列表
+        all_item_position_ids: 所有物品ID token列表对应的位置ID列表
+        optimizer (_type_): 优化器
+        scheduler (_type_): 学习率调度器
+        epoch (_type_): 训练轮数
+    """
+    HLLM.train()
+    list_k = [10, 20, 50, 100]
+    for e in range(epoch):
+        total_loss = 0.0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            dic = HLLM(batch)
+            loss = dic["loss"]
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+        avg_loss = total_loss / len(train_loader)
+        with open(f"train_loss.txt", "w") as f:
+            f.write(f"Epoch {e}: Average Loss = {avg_loss}")
+        recall_dict, ndcg_dict = metric(HLLM, test_loader, all_item_ids, all_item_cu_lens, all_item_position_ids, list_k)
+        with open(f"test_metrics.txt", "w") as f:
+            for k in list_k:
+                f.write(f"Epoch {e}, K={k}: Recall = {recall_dict[k] * 100} %, NDCG = {ndcg_dict[k] * 100}%\n")
