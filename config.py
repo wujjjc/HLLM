@@ -1,5 +1,22 @@
+import torch
 from dataclasses import dataclass, field
-from typing import List, Optional                                                                                                                                                 
+from typing import List, Optional
+
+
+def get_device():
+    """选择显存占用最少的 GPU，没有可用 GPU 则返回 CPU"""
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    num_gpus = torch.cuda.device_count()
+    best_gpu = 0
+    min_free = 0
+    for i in range(num_gpus):
+        free, total = torch.cuda.mem_get_info(i)  # 返回字节数
+        if free > min_free:
+            min_free = free
+            best_gpu = i
+    print(f"Using GPU {best_gpu} with {min_free / 1e9:.2f} GB free memory")
+    return torch.device(f"cuda:{best_gpu}")                               
                                                                                                                                                                                 
 @dataclass                                                                                                                                                                        
 class HLLMConfig:                                                                                                                                                                 
@@ -24,7 +41,7 @@ class HLLMConfig:
     eval_batch_size: int = 256
     learning_rate: float = 1e-4                                                                                                                                                   
     weight_decay: float = 0.01                                                                                                                                                    
-    warmup_ratio: float = 0.1                                                                                                                                                     
+    warmup_ratio: float = 0.001                                                                                                                                                     
     max_grad_norm: float = 1.0                                                                                                                                                    
                                                                                                                                                                                 
     # ==== NCE loss 参数 ====                                                                                                                                                     

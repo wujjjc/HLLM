@@ -1,16 +1,30 @@
+import os
 from model import *
 from data import *
 from config import *
-from train import train
+from train import train, load_checkpoint
+from transformers import get_cosine_schedule_with_warmup
+
+device = get_device()
 config = HLLMConfig()
-net = HLLM(config)
-item_map = new_item_id_mapping(os.path.join(config.text_path, config.dataset_name + "csv"))
+net = HLLM(config).to(device)
+item_map = new_item_id_mapping(config)
 train_history, test_history = split_user_histories(config, 0.1, item_map)
 train_dataset = HLLMDataset(config, train_history, item_map)
 test_dataset = HLLMTestDataset(config, test_history)
 all_item_ids, all_item_cu_lens, all_item_position_ids = train_dataset.get_all_items()
+all_item_ids = all_item_ids.to(device)
+all_item_cu_lens = all_item_cu_lens.to(device)
+all_item_position_ids = all_item_position_ids.to(device)
 train_loader = DataLoader(train_dataset, batch_size=config.train_batch_size, shuffle=True, collate_fn=train_dataset.collate_fn)
 test_loader = DataLoader(test_dataset, batch_size=config.eval_batch_size, shuffle=False, collate_fn=test_dataset.collate_fn)
-optimizer = torch.optim.Adam(net.parameters(), lr=config.learning_rate)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
-train(net, train_loader, test_loader, all_item_ids, all_item_cu_lens, all_item_position_ids, optimizer, scheduler, config.epochs)
+optimizer = torch.optim.Adam(net.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(len(train_loader) * config.epochs * config.warmup_ratio),\
+                                            num_training_steps=len(train_loader) * config.epochs)
+
+start_epoch, best_metric = 0, 0.0
+checkpoint_path = os.path.join(config.checkpoint_dir, "latest.pt")
+if os.path.exists(checkpoint_path):
+    start_epoch, best_metric = load_checkpoint(checkpoint_path, net, optimizer, scheduler)
+
+train(net, train_loader, test_loader, all_item_ids, all_item_cu_lens, all_item_position_ids, optimizer, scheduler, config.epochs, device, config, start_epoch, best_metric)

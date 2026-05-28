@@ -1,7 +1,8 @@
-import torch    
-import pandas as pd                                                                                                                                                               
-from torch.utils.data import Dataset, DataLoader                                                                                                                                  
-from transformers import AutoTokenizer  
+import torch
+import random
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
 import os
 
 def new_item_id_mapping(config):
@@ -118,8 +119,8 @@ class HLLMDataset(Dataset):
                 val = getattr(row, key, "")                                                                                                                                               
                 if val:                                                                                                                                                                   
                     parts.append(f"{key}: {val}")
-            self.item_texts[item_id] = ", ".join(parts) # 将多个文本字段合并成一个字符串
-        self.tokenizer = AutoTokenizer.from_pretrained(config.item_pretrain_dir)  
+            self.item_texts[item_id] = "".join(parts) # 将多个文本字段合并成一个字符串
+        self.tokenizer = AutoTokenizer.from_pretrained(config.item_pretrain_dir, use_fast=False)  
         self.tokenizer.pad_token = self.tokenizer.eos_token  
     def __len__(self):
         return len(self.user_histories)
@@ -159,7 +160,7 @@ class HLLMDataset(Dataset):
         tokens['input_ids'] 或 tokens.input_ids 均可访问。
         """
         tokens = self.tokenizer(
-            text, 
+            text,
             max_length=self.config.MAX_TEXT_LENGTH,
             truncation=True,
             return_tensors="pt",
@@ -170,12 +171,12 @@ class HLLMDataset(Dataset):
         return input_id, position_ids
     
     def _sample_negatives(self, history):
-        all_items = self.all_items.copy()
-        for item_id in history:
-            all_items.discard(item_id)
-        negatives = list(all_items)
-        indices = torch.randperm(len(negatives))[:self.negative_num]                                                                                                                      
-        neg_samples = [negatives[i] for i in indices.tolist()]  
+        history_set = set(history)
+        neg_samples = []
+        while len(neg_samples) < self.negative_num:
+            item = random.randint(0, len(self.all_items) - 1)
+            if item not in history_set:
+                neg_samples.append(item)
         return neg_samples
     
     def __getitem__(self, idx):
@@ -226,19 +227,19 @@ class HLLMDataset(Dataset):
             pos_all_ids.append(item["history"] + [item["pos_id"]])
             neg_all_ids.append(item["neg_ids"])
         attention_mask = torch.tensor(attention_mask, dtype=torch.long)  # [N, S]
-        pos_input_ids_list = [] # 每个 item 的 token id 列表
-        pos_cu_lens = []       # 每个 item 的 token 长度
-        pos_position_ids_list = [] # 每个 item 的位置 id 列表
+        pos_input_ids_list = []
+        pos_cu_lens = []
+        pos_position_ids_list = []
         for pos_id_list in pos_all_ids:
             for pos_id in pos_id_list:
-                if pos_id == -1:  # 跳过 padding 的 item_id
-                    input_ids, position_ids = torch.tensor([self.tokenizer.pad_token_id]), torch.tensor([0]) # padding token 的 id 和位置 id
+                if pos_id == -1:  # padding item，用空文本 tokenize
+                    input_ids, position_ids = torch.tensor([self.tokenizer.pad_token_id]), torch.tensor([0])
                 else:
-                    input_ids, position_ids = self.tokenize_item(pos_id) # 将 item_id 转换为文本并进行 tokenization
-                pos_input_ids_list.append(input_ids) # 将每个 item 的 token id 列表添加到总列表中
-                pos_cu_lens.append(len(input_ids)) # 记录每个 item 的 token 长度
-                pos_position_ids_list.append(position_ids)  # 将每个 item 的相对位置 id 列表添加到总列表中
-        pos_input_ids = torch.cat(pos_input_ids_list, dim=0)  # 拼接成一个大张量
+                    input_ids, position_ids = self.tokenize_item(pos_id)
+                pos_input_ids_list.append(input_ids)
+                pos_cu_lens.append(len(input_ids))
+                pos_position_ids_list.append(position_ids)
+        pos_input_ids = torch.cat(pos_input_ids_list, dim=0)
         pos_cu_lens = torch.tensor(pos_cu_lens, dtype=torch.int32)
         pos_position_ids = torch.cat(pos_position_ids_list, dim=0)
         neg_input_ids_list = []
@@ -248,8 +249,8 @@ class HLLMDataset(Dataset):
             for neg_id in neg_ids:
                 input_ids, position_ids = self.tokenize_item(neg_id)
                 neg_input_ids_list.append(input_ids)
-                neg_cu_lens.append(len(input_ids))
                 neg_position_ids_list.append(position_ids)
+                neg_cu_lens.append(len(input_ids))
         neg_input_ids = torch.cat(neg_input_ids_list, dim=0)
         neg_cu_lens = torch.tensor(neg_cu_lens, dtype=torch.int32)
         neg_position_ids = torch.cat(neg_position_ids_list, dim=0)
@@ -260,6 +261,6 @@ class HLLMDataset(Dataset):
             "neg_input_ids": neg_input_ids,
             "neg_cu_lens": neg_cu_lens,
             "neg_position_ids": neg_position_ids,
-            "attention_mask": attention_mask
+            "attention_mask": attention_mask,
         }
         

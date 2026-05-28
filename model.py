@@ -15,12 +15,15 @@ from REC.model.HLLM.modeling_llama import LlamaForCausalLM
 # 工具函数
 # ============================================================
 
-def all_gather(data, sync_grads=False):
-    """
-    TODO: 跨 GPU 收集张量，单卡则 unsqueeze(0)
-    API: dist.get_world_size(), dist.nn.functional.all_gather()
-    """
-    pass
+# def all_gather(data, sync_grads=False):
+#     world_size = dist.get_world_size()
+#     if world_size > 1:
+#         if sync_grads:
+#             return torch.stack(dist.nn.functional.all_gather(data), dim=0)
+#         with torch.no_grad():
+#             return torch.stack(dist.nn.functional.all_gather(data), dim=0)
+#     else:
+#         return data.unsqueeze(0)
 
 
 # ============================================================
@@ -39,9 +42,9 @@ class HLLM(nn.Module):
           4. self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         """
         super().__init__()
+        self.config = config
         self.item_llm = self._create_llm(config.item_pretrain_dir)
         self.user_llm = self._create_llm(config.user_pretrain_dir)
-        self.config = config
         self.temperature = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         self.all_item_emb = None  # 存储所有 item 的 embedding，评估时使用
         self.item_emb_tokens = nn.Parameter(torch.zeros(1, 1, self.item_llm.config.hidden_size))
@@ -146,6 +149,9 @@ class HLLM(nn.Module):
         pos_logits = (user_embs * target_pos).sum(dim=-1)  # [V, ]
         neg_logits = (user_embs.unsqueeze(1) @ target_neg.transpose(-2, -1)).squeeze(1)  # [V, K]
         with torch.no_grad():
+            fix_logits = (target_pos.unsqueeze(1) @ target_neg.transpose(-2, -1)).squeeze(1)
+            neg_logits[fix_logits > self.config.nce_thres] = torch.finfo(neg_logits.dtype).min
+        with torch.no_grad():
             self.temperature.clamp_(0, np.log(100))
             scale = self.temperature.exp()
         logits = torch.cat([pos_logits.unsqueeze(-1), neg_logits], dim=-1) * scale  # [V, 1+K]
@@ -218,3 +224,7 @@ class HLLM(nn.Module):
             return self.all_item_emb
         self.all_item_emb = self.forward_item_emb(all_item_ids, all_item_position_ids, all_item_cu_lens, self.item_llm) # [num_items, D]
         return self.all_item_emb
+      
+    @torch.no_grad()
+    def _non(self):
+      self.all_item_emb = None
