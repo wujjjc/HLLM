@@ -15,15 +15,17 @@ from REC.model.HLLM.modeling_llama import LlamaForCausalLM
 # 工具函数
 # ============================================================
 
-# def all_gather(data, sync_grads=False):
-#     world_size = dist.get_world_size()
-#     if world_size > 1:
-#         if sync_grads:
-#             return torch.stack(dist.nn.functional.all_gather(data), dim=0)
-#         with torch.no_grad():
-#             return torch.stack(dist.nn.functional.all_gather(data), dim=0)
-#     else:
-#         return data.unsqueeze(0)
+def all_gather(data, group=None, sync_grads=False):
+    """跨 GPU 聚合数据（与原版 basemodel.py 一致）"""
+    group = group if group is not None else dist.group.WORLD
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        from torch.distributed import nn
+        if sync_grads:
+            return torch.stack(nn.functional.all_gather(data, group=group), dim=0)
+        with torch.no_grad():
+            return torch.stack(nn.functional.all_gather(data, group=group), dim=0)
+    else:
+        return data.unsqueeze(0)
 
 
 # ============================================================
@@ -75,7 +77,8 @@ class HLLM(nn.Module):
         hf_config.output_hidden_states = True #确保模型在前向传播时返回所有层的隐藏状态，这对于我们提取 item embedding 是必要的
         hf_config.return_dict = True #确保模型返回一个字典而不是元组，这样我们可以通过键来访问输出
         hf_config.use_ft_flash_attn = self.config.use_ft_flash_attn #如果配置中启用了使用 Flash Attention，则在模型配置中设置相应的标志
-        return LlamaForCausalLM.from_pretrained(pretrain_dir, config=hf_config)
+        model = LlamaForCausalLM.from_pretrained(pretrain_dir, config=hf_config)
+        return model
         
 
     # ── Item Embedding ───────────────────────────
@@ -122,40 +125,40 @@ class HLLM(nn.Module):
     def nce_loss(self, user_embs, target_pos, target_neg, mask):
         """
         输入:
-          user_embs:   [N, S, D]   用户序列表示,即从user LLM 的最后一层隐藏状态切出的 embedding
-          target_pos:  [N, S, D]   正样本 item embedding,每个位置的正确答案
+          user_embs:   [N, S, D]   用户序列表示
+          target_pos:  [N, S, D]   正样本 item embedding
           target_neg:  [N, K, D]   负样本 item embedding
           mask:        [N, S]      1=有效, 0=padding
 
-        步骤:
-          1. logit_scale.clamp_(0, np.log(100)); scale = logit_scale.exp()
-          2. L2 归一化: user_embs, target_pos, target_neg
-          3. pos_logits = cos_sim(user_embs, target_pos, dim=-1)   → [N, S, 1]
-          4. all_gather(target_neg) → neg_all                       → [total_negs, D]
-          5. neg_logits = user_embs @ neg_all.T                     → [N, S, total_negs]
-          6. 去重: 如果 cos(target_pos, neg_all) > nce_thres, 那么 neg_logits = -inf
-          7. logits = cat([pos_logits, neg_logits], dim=-1)[mask] * scale
-          8. labels = zeros; loss = F.cross_entropy(logits, labels)
-
-        返回: loss (scalar)
+        与原版一致: 对 target_neg 做 all_gather 跨卡扩大负样本池
         """
-        user_embs = F.normalize(user_embs, dim=-1) # [N, S, D]
-        target_pos = F.normalize(target_pos, dim=-1) # [N, S, D]
-        target_neg = F.normalize(target_neg, dim=-1) # [N, K, D]
-        shape0, shape1 = torch.nonzero(mask, as_tuple=True)
-        user_embs = user_embs[shape0, shape1] # [V, D]
-        target_pos = target_pos[shape0, shape1] # [V, D]
-        target_neg = target_neg[shape0] # [V, K, D]
-        pos_logits = (user_embs * target_pos).sum(dim=-1)  # [V, ]
-        neg_logits = (user_embs.unsqueeze(1) @ target_neg.transpose(-2, -1)).squeeze(1)  # [V, K]
-        with torch.no_grad():
-            fix_logits = (target_pos.unsqueeze(1) @ target_neg.transpose(-2, -1)).squeeze(1)
-            neg_logits[fix_logits > self.config.nce_thres] = torch.finfo(neg_logits.dtype).min
         with torch.no_grad():
             self.temperature.clamp_(0, np.log(100))
-            scale = self.temperature.exp()
-        logits = torch.cat([pos_logits.unsqueeze(-1), neg_logits], dim=-1) * scale  # [V, 1+K]
-        label = torch.zeros((logits.shape[0]), dtype=torch.long, device=logits.device)  # [V,]
+        scale = self.temperature.exp()
+        D = target_neg.size(-1)
+
+        user_embs = F.normalize(user_embs, dim=-1)  # [N, S, D]
+        target_pos = F.normalize(target_pos, dim=-1)  # [N, S, D]
+
+        shape0, shape1 = torch.nonzero(mask, as_tuple=True)
+        user_embs = user_embs[shape0, shape1]  # [V, D]
+        target_pos = target_pos[shape0, shape1]  # [V, D]
+        target_neg = target_neg[shape0]  # [V, K, D]
+
+        pos_logits = (user_embs * target_pos).sum(dim=-1).unsqueeze(-1)  # [V, 1]
+
+        # 跨卡聚合负样本（与原版 nce_loss 一致）
+        target_neg_flat = target_neg.reshape(-1, D)  # [V*K, D]
+        neg_embedding_all = all_gather(target_neg_flat, sync_grads=True).reshape(-1, D)  # [world*V*K, D]
+        neg_embedding_all = F.normalize(neg_embedding_all, dim=-1)
+        neg_embedding_all = neg_embedding_all.transpose(-1, -2)  # [D, world*V*K]
+
+        neg_logits = torch.matmul(user_embs, neg_embedding_all)  # [V, world*V*K]
+        fix_logits = torch.matmul(target_pos, neg_embedding_all)  # [V, world*V*K]
+        neg_logits[fix_logits > self.config.nce_thres] = torch.finfo(neg_logits.dtype).min
+
+        logits = torch.cat([pos_logits, neg_logits], dim=-1) * scale  # [V, 1+world*V*K]
+        label = torch.zeros(logits.size(0), device=logits.device, dtype=torch.long)
         loss = F.cross_entropy(logits, label)
         return loss
     # ── 训练 Forward ────────────────────────────

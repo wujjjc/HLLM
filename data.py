@@ -1,9 +1,37 @@
 import torch
 import random
+import math
 import pandas as pd
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 import os
+
+
+class NonConsecutiveSequentialDistributedSampler(torch.utils.data.sampler.Sampler):
+    """评估时的分布式 sampler，按 rank 分片（与原版 utils.py 一致）"""
+
+    def __init__(self, dataset, rank=None, num_replicas=None):
+        if num_replicas is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = torch.distributed.get_world_size()
+        if rank is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = torch.distributed.get_rank()
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.total_size = len(self.dataset)
+        self.num_samples = math.ceil((self.total_size - self.rank) / self.num_replicas)
+
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
 
 def new_item_id_mapping(config):
     """将原来的itemid映射到从0开始的整数
@@ -12,7 +40,7 @@ def new_item_id_mapping(config):
     returns:
         dict: 原 item_id 到新 item_id 的映射字典
     """
-    df = pd.read_csv(os.path.join(config.data_path, config.dataset_name + ".csv"))
+    df = pd.read_csv(os.path.join(config.text_path, config.dataset_name + ".csv"))
     unique_items = df['item_id'].unique()
     return {item_id: idx for idx, item_id in enumerate(unique_items)}
 
@@ -29,6 +57,7 @@ def split_user_histories(config, test_ratio=0.1, item_id_mapping=None):
         train_histories: 训练集用户交互字典
         test_histories: 测试集用户交互字典
     """
+    print("开始加载数据")
     file_path = os.path.join(config.data_path, config.dataset_name + ".csv")
     df = pd.read_csv(file_path)
     user_histories = {}
@@ -103,6 +132,7 @@ class HLLMDataset(Dataset):
     | item_i  | user_j  | time_k    |                                                                                                    
     """   
     def __init__(self, config, user_histories, item_id_mapping):
+
         self.config = config
         df_items = pd.read_csv(os.path.join(config.text_path, config.dataset_name + ".csv"))
         self.user_histories = user_histories
@@ -120,18 +150,37 @@ class HLLMDataset(Dataset):
                 if val:                                                                                                                                                                   
                     parts.append(f"{key}: {val}")
             self.item_texts[item_id] = "".join(parts) # 将多个文本字段合并成一个字符串
-        self.tokenizer = AutoTokenizer.from_pretrained(config.item_pretrain_dir, use_fast=False)  
-        self.tokenizer.pad_token = self.tokenizer.eos_token  
+        self.tokenizer = AutoTokenizer.from_pretrained(config.item_pretrain_dir, use_fast=False)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self._token_cache = {}
+        self._build_token_cache()
+
+    def _build_token_cache(self):
+        """一次性 tokenize 所有 item 并缓存"""
+        for item_id in range(len(self.all_items)):
+            text = self.config.item_prompt + self.item_texts[item_id]
+            tokens = self.tokenizer(
+                text,
+                max_length=self.config.MAX_TEXT_LENGTH,
+                truncation=True,
+                return_tensors="pt",
+                padding=False,
+            )
+            input_id = tokens.input_ids.squeeze(0)
+            position_ids = torch.arange(len(input_id))
+            self._token_cache[item_id] = (input_id, position_ids)
+        print(f"Token cache built: {len(self._token_cache)} items")
+
     def __len__(self):
         return len(self.user_histories)
+
     def get_all_items(self):
-        """返回所有item的token表示，相对位置，长度
-        """
+        """返回所有item的token表示，相对位置，长度（从缓存读取）"""
         all_items_token_ids = []
         all_items_position_ids = []
         all_items_cu_lens = []
         for item_id in range(len(self.all_items)):
-            input_ids, position_ids = self.tokenize_item(item_id)
+            input_ids, position_ids = self._token_cache[item_id]
             all_items_token_ids.append(input_ids)
             all_items_position_ids.append(position_ids)
             all_items_cu_lens.append(len(input_ids))
@@ -139,36 +188,10 @@ class HLLMDataset(Dataset):
         all_items_position_ids = torch.cat(all_items_position_ids, dim=0)
         all_items_cu_lens = torch.tensor(all_items_cu_lens, dtype=torch.int32)
         return all_items_token_ids, all_items_position_ids, all_items_cu_lens
-        
+
     def tokenize_item(self, item_id):
-        """
-        将item_id进行token化，返回item_id对应的token id和位置 id。
-        """
-        
-        text = self.config.item_prompt + self.item_texts[item_id]
-        """
-        tokens.input_ids：形状为 (1, seq_len) 的 PyTorch 张量（因为 return_tensors="pt"），存储 token 对应的整数 ID。
-
-        tokens.attention_mask：同样形状的张量，标记有效 token（1）和填充位置（0）。
-
-        tokens.token_type_ids：可选，仅用于 BERT 等需要区分两个句子的模型。在你的例子中由于是单句输入，通常不会包含。
-
-        tokens.keys()：查看返回的字段名。
-
-        tokens.to(device)：可以将所有张量迁移到指定设备（如 GPU）。
-
-        tokens['input_ids'] 或 tokens.input_ids 均可访问。
-        """
-        tokens = self.tokenizer(
-            text,
-            max_length=self.config.MAX_TEXT_LENGTH,
-            truncation=True,
-            return_tensors="pt",
-            padding=False,
-        )
-        input_id = tokens.input_ids.squeeze(0)  # 去掉批次维度，变成 (seq_len,)
-        position_ids = torch.arange(len(input_id))  # 位置 ID 从 0 到 seq_len-1
-        return input_id, position_ids
+        """从缓存返回 item 的 token id 和 position id"""
+        return self._token_cache[item_id]
     
     def _sample_negatives(self, history):
         history_set = set(history)
