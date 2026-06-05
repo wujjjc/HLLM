@@ -3,7 +3,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 import numpy as np
 from transformers import AutoConfig
 
@@ -211,23 +210,35 @@ class HLLM(nn.Module):
         item_emb = F.normalize(self._compute_item(all_item_ids, all_item_cu_lens, all_item_position_ids), dim=-1) # [num_items, D]
         scores = user_emb @ item_emb.transpose(-2, -1) # [N, num_items]
         return scores
-        
-        
-        
 
     @torch.no_grad()
-    def _compute_item(self, all_item_ids, all_item_cu_lens, all_item_position_ids):
+    def _compute_item(self, all_item_ids, all_item_cu_lens, all_item_position_ids, chunk_size=64):
         """
-        预计算所有 item 的 embedding（评估用）
-        步骤:
-          1. emb = forward_item_emb(pos_items, item_llm)  → [num_items, D]
+        预计算所有 item 的 embedding（评估用），分批处理避免 OOM
         返回: item embeddings [num_items, D]
         """
         if self.all_item_emb is not None:
             return self.all_item_emb
-        self.all_item_emb = self.forward_item_emb(all_item_ids, all_item_position_ids, all_item_cu_lens, self.item_llm) # [num_items, D]
+
+        num_items = len(all_item_cu_lens)
+        cu_lens_cumsum = all_item_cu_lens.cumsum(dim=0)
+        all_embs = []
+
+        for start in range(0, num_items, chunk_size):
+            end = min(start + chunk_size, num_items)
+            token_start = cu_lens_cumsum[start - 1].item() if start > 0 else 0
+            token_end = cu_lens_cumsum[end - 1].item()
+
+            batch_ids = all_item_ids[token_start:token_end]
+            batch_position = all_item_position_ids[token_start:token_end]
+            batch_cu_lens = all_item_cu_lens[start:end]
+
+            emb = self.forward_item_emb(batch_ids, batch_position, batch_cu_lens, self.item_llm)
+            all_embs.append(emb)
+
+        self.all_item_emb = torch.cat(all_embs, dim=0)  # [num_items, D]
         return self.all_item_emb
-      
+
     @torch.no_grad()
     def _non(self):
       self.all_item_emb = None
