@@ -6,33 +6,6 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 import os
 
-
-class NonConsecutiveSequentialDistributedSampler(torch.utils.data.sampler.Sampler):
-    """评估时的分布式 sampler，按 rank 分片（与原版 utils.py 一致）"""
-
-    def __init__(self, dataset, rank=None, num_replicas=None):
-        if num_replicas is None:
-            if not torch.distributed.is_available():
-                raise RuntimeError("Requires distributed package to be available")
-            num_replicas = torch.distributed.get_world_size()
-        if rank is None:
-            if not torch.distributed.is_available():
-                raise RuntimeError("Requires distributed package to be available")
-            rank = torch.distributed.get_rank()
-        self.dataset = dataset
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.total_size = len(self.dataset)
-        self.num_samples = math.ceil((self.total_size - self.rank) / self.num_replicas)
-
-    def __iter__(self):
-        indices = list(range(len(self.dataset)))
-        indices = indices[self.rank:self.total_size:self.num_replicas]
-        return iter(indices)
-
-    def __len__(self):
-        return self.num_samples
-
 def new_item_id_mapping(config):
     """将原来的itemid映射到从0开始的整数
     Args:

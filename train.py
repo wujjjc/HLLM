@@ -48,19 +48,20 @@ def metric(hllm, test_loader, all_item_ids, all_item_cu_lens, all_item_position_
     recall_dict = {k: [] for k in list_k}
     ndcg_dict = {k: [] for k in list_k}
     with torch.no_grad():
-        max_k = max(list_k)
+        hllm._non() # 清除缓存的所有物品嵌入
         for batch in test_loader:
             seq = batch["history"].to(device)  # [N, S] 用户历史序列
             pos_id = batch["pos_id"].to(device)  # [N] 正样本物品ID
             mask = batch["mask"].to(device)  # [N, S] 序列掩码
-            topk_scores, topk_indices = hllm._predict(seq, mask, all_item_ids, all_item_cu_lens, all_item_position_ids, topk=max_k)
-            topk_item_ids = topk_indices.cpu().numpy()  # [N, max_k]
-            pos_id_expanded = pos_id.unsqueeze(1).cpu().numpy()  # [N, 1]
+            score = hllm._predict(seq, mask, all_item_ids, all_item_cu_lens, all_item_position_ids) #[N, len(all_item_ids)]
             for k in list_k:
-                hits = (topk_item_ids[:, :k] == pos_id_expanded).astype(float)  # [N, k]
-                recall = hits.sum(axis=1) # [N]
-                ndcg = hits / np.log2(np.arange(2, k + 2).astype(float))  # [N, k]
-                ndcg = ndcg.sum(axis=1)  # [N]
+                top_k_indices = torch.topk(score, k=k, dim=1).indices  # [N, k]
+                top_k_item_ids = top_k_indices.cpu().numpy()  # [N, k] 转为 numpy 数组
+                pos_id_expanded = (pos_id.unsqueeze(1)).cpu().numpy()  # [N, 1]
+                hits = (top_k_item_ids == pos_id_expanded).astype(float)  # [N, k] 是否命中正样本
+                recall = hits.sum(axis=1) # [N] 召回率（正样本是否在Top-k中）
+                ndcg = hits / np.log2(np.arange(2, k + 2).astype(float))  # [N, k] NDCG增益
+                ndcg = ndcg.sum(axis=1)  # [N] NDCG值
                 recall_dict[k].extend(recall)
                 ndcg_dict[k].extend(ndcg)
     for k in list_k:
@@ -92,7 +93,6 @@ def train(hllm, train_loader, test_loader, all_item_ids, all_item_cu_lens, all_i
     list_k = [10, 20, 50, 100]
     for e in range(start_epoch, epoch):
         total_loss = 0.0
-        i = 0
         for batch in train_loader:
             optimizer.zero_grad()
             for key in batch:
@@ -104,13 +104,10 @@ def train(hllm, train_loader, test_loader, all_item_ids, all_item_cu_lens, all_i
             optimizer.step()
             scheduler.step()
             total_loss += loss.item()
-            # with open(f"train_loss_batch.txt", "a") as f:
-            #     f.write(f"Epoch {e}, Batch: {i}: Loss = {loss.item()}\n")
-            # i += 1
         avg_loss = total_loss / len(train_loader)
         with open(f"train_loss.txt", "a") as f:
             f.write(f"Epoch {e}: Average Loss = {avg_loss}")
-        torch.save(hllm.state_dict(), "latest_model.pt")
+        torch.save(hllm.state_dict(), os.path.join(config.checkpoint_dir, f"latest.pt"))
         recall_dict, ndcg_dict = metric(hllm, test_loader, all_item_ids, all_item_cu_lens, all_item_position_ids, list_k, device)
         with open(f"test_metrics.txt", "a") as f:
             for k in list_k:
